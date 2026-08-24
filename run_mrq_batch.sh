@@ -17,4 +17,4 @@ BEDLAM_MRQ_RESOLUTION=128x128 \
 BEDLAM_MRQ_LEGACY_MOTION_BLUR=false \
 BEDLAM_MRQ_NUM_BATCHES=20 \
 BEDLAM_MRQ_START_SEQUENCE_INDEX=896 \
-scripts/run_ue53_create_movie_render_queue_batch.s
+scripts/run_ue53_create_movie_render_queue_batch.sh
