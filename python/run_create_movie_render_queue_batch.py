@@ -324,9 +324,13 @@ def tick(_delta_seconds):
                 pipeline_queue.delete_job(job)
 
         total_jobs = sum(batch["job_count"] for batch in batches)
+        remaining_sequence_names = [
+            str(p).rsplit("/", 1)[-1].split(".", 1)[0] for p in remaining_sequences
+        ]
         write_status(
             "complete",
-            expected_sequences=expected_names,
+            expected_sequences=remaining_sequence_names,
+            all_expected_sequences=expected_names,
             total_sequences=len(remaining_sequences),
             total_jobs=total_jobs,
             num_batches=len(batches),

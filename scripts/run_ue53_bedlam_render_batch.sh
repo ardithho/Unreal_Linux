@@ -75,6 +75,11 @@ echo "Rendering batch range: [$BATCH_START_INDEX, $BATCH_END_INDEX)"
 
 SUMMARY_STATUS_PATH="${BEDLAM_RUNTIME_BATCH_SUMMARY_PATH:-$BEDLAM_GENERATED_ASSET_STORE/linux_bedlam_render_batch_status.json}"
 
+# Captured once, before the loop overwrites BEDLAM_RUNTIME_PROBE_DIR on each
+# iteration -- reading it inside the loop would pick up the previous batch's
+# already-tagged directory instead of the caller's original base path.
+PROBE_DIR_ROOT="${BEDLAM_RUNTIME_PROBE_DIR:-${BEDLAM_LOG_ROOT:-$PWD/unreal_logs}/bedlam_camera_runtime}"
+
 SUCCEEDED=()
 FAILED=()
 
@@ -85,7 +90,7 @@ for (( batch_index=BATCH_START_INDEX; batch_index<BATCH_END_INDEX; batch_index++
     echo "=============================================================="
 
     RUN_TAG="${SLURM_JOB_ID:-manual}_batch${batch_index}_$(date +%Y%m%d_%H%M%S)"
-    export BEDLAM_RUNTIME_PROBE_DIR="${BEDLAM_RUNTIME_PROBE_DIR_BASE:-${BEDLAM_LOG_ROOT:-$PWD/unreal_logs}/bedlam_camera_runtime}/${RUN_TAG}"
+    export BEDLAM_RUNTIME_PROBE_DIR="$PROBE_DIR_ROOT/${RUN_TAG}"
     export BEDLAM_RUNTIME_RENDER_DIR="${BEDLAM_RUNTIME_RENDER_DIR:-${BEDLAM_OUTPUT_ROOT:-$PWD/render_outputs}}"
     export BEDLAM_RUNTIME_QUEUE_ASSET="$queue_asset"
     export BEDLAM_RUNTIME_START_DELAY="${BEDLAM_RUNTIME_START_DELAY:-15}"
