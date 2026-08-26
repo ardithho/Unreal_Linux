@@ -16,12 +16,14 @@
 #
 # If more than one GPU is visible in the allocation, batches are split
 # round-robin across that many concurrent UnrealEditor processes, each
-# pinned to one physical GPU via CUDA_VISIBLE_DEVICES (the NVIDIA driver
-# also honors this for Vulkan device enumeration, not just CUDA). This is
-# UNVERIFIED on this cluster -- confirm with `nvidia-smi` during a run that
-# each process actually lands on its assigned GPU before trusting it for a
-# real job. Override the detected count with BEDLAM_RUNTIME_NUM_GPUS, or
-# force single-GPU sequential behavior with BEDLAM_RUNTIME_NUM_GPUS=1.
+# pinned to one physical GPU via the engine's own `-graphicsadapter=N`
+# launch argument. CUDA_VISIBLE_DEVICES was tried first and confirmed NOT
+# to affect Vulkan device selection in this environment (2026-08-26: both
+# lanes landed on the same physical GPU with it) -- do not reintroduce it
+# as the pinning mechanism without re-testing. Confirm `-graphicsadapter`
+# actually works here too with `nvidia-smi` during a run before trusting it
+# for a real job. Override the detected count with BEDLAM_RUNTIME_NUM_GPUS,
+# or force single-GPU sequential behavior with BEDLAM_RUNTIME_NUM_GPUS=1.
 #
 # A failed batch does not abort the run: this script deliberately does not
 # use `set -e` around the per-batch UnrealEditor invocation, so one crashed
@@ -168,8 +170,7 @@ render_lane() {
             texture_streaming_args+=(-NoTextureStreaming)
         fi
 
-        if CUDA_VISIBLE_DEVICES="$gpu_index" \
-            BEDLAM_RUNTIME_PROBE_DIR="$probe_dir" \
+        if BEDLAM_RUNTIME_PROBE_DIR="$probe_dir" \
             BEDLAM_RUNTIME_RENDER_DIR="$render_dir" \
             BEDLAM_RUNTIME_QUEUE_ASSET="$queue_asset" \
             BEDLAM_RUNTIME_START_DELAY="${BEDLAM_RUNTIME_START_DELAY:-15}" \
@@ -187,6 +188,7 @@ render_lane() {
                 "-ExecCmds=$exec_cmds" \
                 -RenderOffscreen \
                 -vulkan \
+                "-graphicsadapter=$gpu_index" \
                 -unattended \
                 -NoSplash \
                 "${texture_streaming_args[@]}" \
