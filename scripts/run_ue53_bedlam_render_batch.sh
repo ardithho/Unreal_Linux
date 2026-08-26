@@ -16,14 +16,21 @@
 #
 # If more than one GPU is visible in the allocation, batches are split
 # round-robin across that many concurrent UnrealEditor processes, each
-# pinned to one physical GPU via the engine's own `-graphicsadapter=N`
-# launch argument. CUDA_VISIBLE_DEVICES was tried first and confirmed NOT
-# to affect Vulkan device selection in this environment (2026-08-26: both
-# lanes landed on the same physical GPU with it) -- do not reintroduce it
-# as the pinning mechanism without re-testing. Confirm `-graphicsadapter`
-# actually works here too with `nvidia-smi` during a run before trusting it
-# for a real job. Override the detected count with BEDLAM_RUNTIME_NUM_GPUS,
-# or force single-GPU sequential behavior with BEDLAM_RUNTIME_NUM_GPUS=1.
+# launched via `srun --exclusive --gres=gpu:1` so Slurm's cgroup device
+# plugin restricts that step to exactly one physical GPU. Two app-level
+# pinning mechanisms were tried first and BOTH confirmed NOT to affect
+# Vulkan device selection in this environment: CUDA_VISIBLE_DEVICES
+# (2026-08-26: both lanes landed on the same physical GPU with it) and the
+# engine's own `-graphicsadapter=N` launch argument (2026-08-26: same
+# failure -- two distinct UnrealEditor PIDs both showed up on GPU 0 in
+# `nvidia-smi`). Do not reintroduce either as the pinning mechanism without
+# re-testing; cgroup-level device isolation via srun works regardless of
+# what the driver/engine does with adapter-index hints, since the other
+# GPUs' device nodes simply aren't present in the step's cgroup. Confirm
+# with `nvidia-smi` during a run that each srun step actually lands on a
+# distinct GPU before trusting this for a real job. Override the detected
+# count with BEDLAM_RUNTIME_NUM_GPUS, or force single-GPU sequential
+# behavior with BEDLAM_RUNTIME_NUM_GPUS=1.
 #
 # A failed batch does not abort the run: this script deliberately does not
 # use `set -e` around the per-batch UnrealEditor invocation, so one crashed
@@ -111,6 +118,26 @@ if [[ "$NUM_GPUS" -gt "$BATCHES_IN_RANGE" ]]; then
     NUM_GPUS="$BATCHES_IN_RANGE"
 fi
 
+LAUNCH_PREFIX=()
+if [[ "$NUM_GPUS" -gt 1 ]]; then
+    if [[ -z "${SLURM_JOB_ID:-}" ]] || ! command -v srun >/dev/null 2>&1; then
+        echo "ERROR: $NUM_GPUS parallel GPU lanes requested but not running inside a Slurm" >&2
+        echo "       allocation (or srun is unavailable). Cgroup-based GPU isolation via" >&2
+        echo "       srun --gres=gpu:1 is required for correct multi-GPU pinning -- see the" >&2
+        echo "       note above render_lane(). Submit via sbatch, or set" >&2
+        echo "       BEDLAM_RUNTIME_NUM_GPUS=1 to render sequentially instead." >&2
+        exit 2
+    fi
+    # Give each step an explicit CPU share of the allocation. Without this,
+    # `--exclusive` can make a step claim the whole job's CPUs, serializing
+    # the "parallel" lanes on CPU even though their GPUs are now isolated.
+    LANE_CPUS=$(( ${SLURM_CPUS_PER_TASK:-$NUM_GPUS} / NUM_GPUS ))
+    if [[ "$LANE_CPUS" -lt 1 ]]; then
+        LANE_CPUS=1
+    fi
+    LAUNCH_PREFIX=(srun --exclusive --gres=gpu:1 --ntasks=1 --cpus-per-task="$LANE_CPUS" --cpu-bind=none)
+fi
+
 echo "Total batches:         $TOTAL_BATCHES"
 echo "Rendering batch range: [$BATCH_START_INDEX, $BATCH_END_INDEX)"
 echo "Parallel GPU lanes:    $NUM_GPUS"
@@ -182,13 +209,14 @@ render_lane() {
             BEDLAM_RUNTIME_IMAGE_SPATIAL_SAMPLES="${BEDLAM_RUNTIME_IMAGE_SPATIAL_SAMPLES:-0}" \
             BEDLAM_RUNTIME_IMAGE_TEMPORAL_SAMPLES="${BEDLAM_RUNTIME_IMAGE_TEMPORAL_SAMPLES:-0}" \
             BEDLAM_RUNTIME_WRITE_DONE_MARKERS="$WRITE_DONE_MARKERS" \
+            "${LAUNCH_PREFIX[@]}" \
             "$UE_ROOT/Engine/Binaries/Linux/UnrealEditor" \
                 "$PROJECT" \
                 "$MAP" \
                 "-ExecCmds=$exec_cmds" \
                 -RenderOffscreen \
                 -vulkan \
-                "-graphicsadapter=$gpu_index" \
+                -graphicsadapter=0 \
                 -unattended \
                 -NoSplash \
                 "${texture_streaming_args[@]}" \
