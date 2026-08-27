@@ -12,5 +12,6 @@ source args.sh
 
 BEDLAM_GENERATED_ASSET_STORE="$ASSETS" \
 BEDLAM_RUNTIME_EXEC_CMDS='tick.AllowAsyncTickDispatch 0,tick.AllowConcurrentTickQueue 0' \
-BEDLAM_RUNTIME_BATCH_START_INDEX=0 \
+# BEDLAM_RUNTIME_BATCH_START_INDEX=0 \
+BEDLAM_RUNTIME_BATCH_INDICES=1,5,7,9 \
 scripts/run_ue53_bedlam_render_batch.sh

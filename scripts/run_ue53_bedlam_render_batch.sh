@@ -45,7 +45,10 @@
 # use `set -e` around the per-batch UnrealEditor invocation, so one crashed
 # batch is recorded and the rest still get attempted. Failed batch indices
 # are printed and written to the summary status file; rerun just those with
-# BEDLAM_RUNTIME_BATCH_START_INDEX / BEDLAM_RUNTIME_BATCH_LIMIT.
+# BEDLAM_RUNTIME_BATCH_INDICES="5,7,9" (a comma-separated list of specific,
+# possibly non-contiguous indices), or fall back to a contiguous range via
+# BEDLAM_RUNTIME_BATCH_START_INDEX / BEDLAM_RUNTIME_BATCH_LIMIT when
+# BEDLAM_RUNTIME_BATCH_INDICES is unset.
 
 set -uo pipefail
 
@@ -81,18 +84,50 @@ if [[ "$TOTAL_BATCHES" -eq 0 ]]; then
     exit 1
 fi
 
-BATCH_START_INDEX="${BEDLAM_RUNTIME_BATCH_START_INDEX:-0}"
-BATCH_LIMIT="${BEDLAM_RUNTIME_BATCH_LIMIT:-0}"
-if [[ "$BATCH_START_INDEX" -ge "$TOTAL_BATCHES" ]]; then
-    echo "ERROR: BEDLAM_RUNTIME_BATCH_START_INDEX=$BATCH_START_INDEX >= total batches ($TOTAL_BATCHES)" >&2
-    exit 2
-fi
-BATCH_END_INDEX=$TOTAL_BATCHES
-if [[ "$BATCH_LIMIT" -gt 0 ]]; then
-    BATCH_END_INDEX=$((BATCH_START_INDEX + BATCH_LIMIT))
-    if [[ "$BATCH_END_INDEX" -gt "$TOTAL_BATCHES" ]]; then
-        BATCH_END_INDEX=$TOTAL_BATCHES
+# BEDLAM_RUNTIME_BATCH_INDICES picks specific, possibly non-contiguous
+# batches (e.g. "5,7,9" to retry just the ones that stalled/failed) and
+# takes precedence over BEDLAM_RUNTIME_BATCH_START_INDEX/_LIMIT, which
+# select a contiguous range instead. Either way the result is
+# REQUESTED_BATCHES, the sorted, de-duplicated list of indices actually
+# rendered below.
+REQUESTED_BATCHES=()
+if [[ -n "${BEDLAM_RUNTIME_BATCH_INDICES:-}" ]]; then
+    IFS=',' read -r -a _raw_indices <<< "$BEDLAM_RUNTIME_BATCH_INDICES"
+    for idx in "${_raw_indices[@]}"; do
+        idx="${idx// /}"
+        [[ -n "$idx" ]] || continue
+        if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: BEDLAM_RUNTIME_BATCH_INDICES has a non-integer entry: '$idx'" >&2
+            exit 2
+        fi
+        if [[ "$idx" -ge "$TOTAL_BATCHES" ]]; then
+            echo "ERROR: BEDLAM_RUNTIME_BATCH_INDICES has index $idx >= total batches ($TOTAL_BATCHES)" >&2
+            exit 2
+        fi
+        REQUESTED_BATCHES+=("$idx")
+    done
+    mapfile -t REQUESTED_BATCHES < <(printf '%s\n' "${REQUESTED_BATCHES[@]}" | sort -nu)
+    if [[ "${#REQUESTED_BATCHES[@]}" -eq 0 ]]; then
+        echo "ERROR: BEDLAM_RUNTIME_BATCH_INDICES did not contain any valid indices" >&2
+        exit 2
     fi
+else
+    BATCH_START_INDEX="${BEDLAM_RUNTIME_BATCH_START_INDEX:-0}"
+    BATCH_LIMIT="${BEDLAM_RUNTIME_BATCH_LIMIT:-0}"
+    if [[ "$BATCH_START_INDEX" -ge "$TOTAL_BATCHES" ]]; then
+        echo "ERROR: BEDLAM_RUNTIME_BATCH_START_INDEX=$BATCH_START_INDEX >= total batches ($TOTAL_BATCHES)" >&2
+        exit 2
+    fi
+    BATCH_END_INDEX=$TOTAL_BATCHES
+    if [[ "$BATCH_LIMIT" -gt 0 ]]; then
+        BATCH_END_INDEX=$((BATCH_START_INDEX + BATCH_LIMIT))
+        if [[ "$BATCH_END_INDEX" -gt "$TOTAL_BATCHES" ]]; then
+            BATCH_END_INDEX=$TOTAL_BATCHES
+        fi
+    fi
+    for (( idx=BATCH_START_INDEX; idx<BATCH_END_INDEX; idx++ )); do
+        REQUESTED_BATCHES+=("$idx")
+    done
 fi
 
 test -x "$UE_ROOT/Engine/Binaries/Linux/UnrealEditor" || { echo "ERROR: UnrealEditor not found/executable: $UE_ROOT" >&2; exit 1; }
@@ -122,9 +157,8 @@ fi
 # Required for more than one UnrealEditor process to run concurrently in
 # this environment.
 export ALLOW_PARALLEL_UNREAL=1
-BATCHES_IN_RANGE=$((BATCH_END_INDEX - BATCH_START_INDEX))
-if [[ "$NUM_GPUS" -gt "$BATCHES_IN_RANGE" ]]; then
-    NUM_GPUS="$BATCHES_IN_RANGE"
+if [[ "$NUM_GPUS" -gt "${#REQUESTED_BATCHES[@]}" ]]; then
+    NUM_GPUS="${#REQUESTED_BATCHES[@]}"
 fi
 
 LAUNCH_PREFIX=()
@@ -159,7 +193,7 @@ if [[ "$NUM_GPUS" -gt 1 ]]; then
 fi
 
 echo "Total batches:         $TOTAL_BATCHES"
-echo "Rendering batch range: [$BATCH_START_INDEX, $BATCH_END_INDEX)"
+echo "Rendering batch indices (${#REQUESTED_BATCHES[@]}): ${REQUESTED_BATCHES[*]}"
 echo "Parallel GPU lanes:    $NUM_GPUS"
 
 SUMMARY_STATUS_PATH="${BEDLAM_RUNTIME_BATCH_SUMMARY_PATH:-$BEDLAM_GENERATED_ASSET_STORE/linux_bedlam_render_batch_status.json}"
@@ -269,8 +303,8 @@ LANE_PIDS=()
 LANE_RESULT_FILES=()
 for (( gpu_index=0; gpu_index<NUM_GPUS; gpu_index++ )); do
     lane_batches=()
-    for (( batch_index=BATCH_START_INDEX + gpu_index; batch_index<BATCH_END_INDEX; batch_index+=NUM_GPUS )); do
-        lane_batches+=("$batch_index")
+    for (( i=gpu_index; i<${#REQUESTED_BATCHES[@]}; i+=NUM_GPUS )); do
+        lane_batches+=("${REQUESTED_BATCHES[i]}")
     done
     if [[ "${#lane_batches[@]}" -eq 0 ]]; then
         continue
@@ -309,20 +343,20 @@ done
 
 succeeded_json=$(printf '%s\n' "${SUCCEEDED[@]}" | jq -R 'select(length>0) | tonumber' | jq -s 'sort')
 failed_json=$(printf '%s\n' "${FAILED[@]}" | jq -R 'select(length>0) | tonumber' | jq -s 'sort')
+attempted_json=$(printf '%s\n' "${REQUESTED_BATCHES[@]}" | jq -R 'select(length>0) | tonumber' | jq -s 'sort')
 jq -n \
     --argjson total "$TOTAL_BATCHES" \
-    --argjson start "$BATCH_START_INDEX" \
-    --argjson end "$BATCH_END_INDEX" \
+    --argjson attempted "$attempted_json" \
     --argjson gpus "$NUM_GPUS" \
     --argjson succeeded "$succeeded_json" \
     --argjson failed "$failed_json" \
-    '{total_batches: $total, attempted_range: [$start, $end], parallel_gpu_lanes: $gpus, succeeded: $succeeded, failed: $failed}' \
+    '{total_batches: $total, attempted_batches: $attempted, parallel_gpu_lanes: $gpus, succeeded: $succeeded, failed: $failed}' \
     > "$SUMMARY_STATUS_PATH"
 
 echo "=============================================================="
 echo "Batch render summary: $SUMMARY_STATUS_PATH"
 echo "  Parallel GPU lanes: $NUM_GPUS"
-echo "  Succeeded: ${#SUCCEEDED[@]}/$((BATCH_END_INDEX - BATCH_START_INDEX))"
+echo "  Succeeded: ${#SUCCEEDED[@]}/${#REQUESTED_BATCHES[@]}"
 echo "  Failed:    ${#FAILED[@]}"
 if [[ ${#FAILED[@]} -gt 0 ]]; then
     echo "  Failed batch indices: ${FAILED[*]}"
