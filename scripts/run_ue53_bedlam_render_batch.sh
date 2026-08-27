@@ -32,6 +32,15 @@
 # count with BEDLAM_RUNTIME_NUM_GPUS, or force single-GPU sequential
 # behavior with BEDLAM_RUNTIME_NUM_GPUS=1.
 #
+# Each srun step also passes `--exact` with an explicit --cpus-per-task and
+# --mem share. Without `--exact`, a step claims all non-GRES resources (all
+# CPUs, all memory) of the whole job allocation regardless of
+# --cpus-per-task (see `man srun`), so with `--exclusive` a second
+# concurrent step just blocks ("step creation ... retrying (Requested nodes
+# are busy)") waiting for the first to exit. On 2026-08-26 this burned an
+# entire 8-hour job: lane 0 ran, lane 1 never started, and the job was
+# killed by the time limit. Do not drop `--exact` from LAUNCH_PREFIX.
+#
 # A failed batch does not abort the run: this script deliberately does not
 # use `set -e` around the per-batch UnrealEditor invocation, so one crashed
 # batch is recorded and the rest still get attempted. Failed batch indices
@@ -128,14 +137,25 @@ if [[ "$NUM_GPUS" -gt 1 ]]; then
         echo "       BEDLAM_RUNTIME_NUM_GPUS=1 to render sequentially instead." >&2
         exit 2
     fi
-    # Give each step an explicit CPU share of the allocation. Without this,
-    # `--exclusive` can make a step claim the whole job's CPUs, serializing
-    # the "parallel" lanes on CPU even though their GPUs are now isolated.
+    # Give each step an explicit CPU and memory share of the allocation.
+    # `--exact` is required for concurrent steps to coexist at all: per
+    # `man srun`, WITHOUT it a step claims all non-GRES resources (all CPUs,
+    # all memory) of the whole job allocation regardless of --cpus-per-task,
+    # so a second `--exclusive` step just blocks ("step creation ... retrying
+    # (Requested nodes are busy)") waiting for the first to exit -- which is
+    # what happened on 2026-08-26 and burned the full job time limit with
+    # lane 1 never starting. `--exact` scopes each step to only what it
+    # explicitly requests, freeing the rest of the allocation for siblings.
     LANE_CPUS=$(( ${SLURM_CPUS_PER_TASK:-$NUM_GPUS} / NUM_GPUS ))
     if [[ "$LANE_CPUS" -lt 1 ]]; then
         LANE_CPUS=1
     fi
-    LAUNCH_PREFIX=(srun --exclusive --gres=gpu:1 --ntasks=1 --cpus-per-task="$LANE_CPUS" --cpu-bind=none)
+    LANE_MEM_MB=$(( ${SLURM_MEM_PER_NODE:-0} / NUM_GPUS ))
+    LANE_MEM_ARGS=()
+    if [[ "$LANE_MEM_MB" -gt 0 ]]; then
+        LANE_MEM_ARGS=(--mem="${LANE_MEM_MB}M")
+    fi
+    LAUNCH_PREFIX=(srun --exclusive --exact --gres=gpu:1 --ntasks=1 --cpus-per-task="$LANE_CPUS" "${LANE_MEM_ARGS[@]}" --cpu-bind=none)
 fi
 
 echo "Total batches:         $TOTAL_BATCHES"
@@ -183,7 +203,15 @@ render_lane() {
         probe_dir="$PROBE_DIR_ROOT/${run_tag}"
         render_dir="$RENDER_DIR_ROOT"
         zen_dir="/tmp/${USER}/unreal_zen_5.3.2_${run_tag}"
-        ddc_dir="/tmp/${USER}/unreal_ddc_5.3.2"
+        # Per-lane, not per-batch: reused across a lane's own sequential
+        # batches for cache-hit benefit, but never shared with a
+        # concurrently-running lane. A single shared DDC dir let two
+        # UnrealEditor processes hit the same filesystem cache lock files at
+        # once, which can block one of them indefinitely with zero output
+        # and no error (observed 2026-08-27, job 832439: GPU 0's batch sat
+        # with a live process and no progress once GPU 1 was truly running
+        # concurrently).
+        ddc_dir="/tmp/${USER}/unreal_ddc_5.3.2_gpu${gpu_index}"
         mkdir -p "$zen_dir" "$ddc_dir" "$probe_dir" "$render_dir"
 
         if [[ -n "$BASE_EXEC_CMDS" ]]; then
