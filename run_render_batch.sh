@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=bedlam-render-batch
 #SBATCH --partition=gpu
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
 #SBATCH --time=08:00:00
